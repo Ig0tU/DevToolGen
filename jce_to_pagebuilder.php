@@ -25,6 +25,7 @@ class ArticleConverter
     protected $db;
     protected $logFile;
     protected $joomlaVersion;
+    protected $conversionLogMessages = []; // Added for storing log messages
     
     public function __construct()
     {
@@ -45,30 +46,44 @@ class ArticleConverter
         return $this->joomlaVersion;
     }
 
-    public function convert()
+    public function convert(array $articleIds = [])
     {
-        $this->log("Starting conversion process");
+        if (empty($articleIds)) {
+            $this->log("No article IDs provided for conversion. Nothing to process.", 'info');
+            return true; // Or return a specific status/message array
+        }
+
+        $this->log("Starting conversion process for specific article IDs: " . implode(', ', $articleIds), 'info');
         
+        // Ensure IDs are integers for security and query correctness
+        $safeArticleIds = array_map('intval', $articleIds);
+
         $query = $this->db->getQuery(true)
-            ->select($this->db->quoteName(['id', 'title', 'introtext', 'fulltext']))
+            ->select($this->db->quoteName(['id', 'title', 'introtext', 'fulltext'])) // 'fulltext' is needed for backup, 'introtext' for conversion
             ->from($this->db->quoteName('#__content'))
-            ->where($this->db->quoteName('fulltext') . ' = ' . $this->db->quote(''))
-            ->where($this->db->quoteName('introtext') . ' != ' . $this->db->quote(''));
+            ->where($this->db->quoteName('id') . ' IN (' . implode(',', $safeArticleIds) . ')');
         
         $this->db->setQuery($query);
-        $this->log("Executing query: " . $query->dump());
-        
+        $this->log("Executing query for specific IDs: " . $query->dump());
+
         try {
             $articles = $this->db->loadObjectList();
-            $this->log("Found " . count($articles) . " articles to convert");
+            if (empty($articles)) {
+                $this->log("No articles found for the provided IDs: " . implode(', ', $safeArticleIds), 'warning');
+                return true;
+            }
+            $this->log("Found " . count($articles) . " articles to convert from the provided list.");
             
             foreach ($articles as $article) {
+                // The existing convertSingleArticle logic will use $article->introtext.
+                // If $article->introtext is empty for a specifically chosen ID, it will be logged
+                // by convertSingleArticle or parseContentIntoElements, which is fine.
                 $this->convertSingleArticle($article);
             }
             
             return true;
         } catch (Exception $e) {
-            $this->log("Error: " . $e->getMessage(), 'error');
+            $this->log("Error during article conversion: " . $e->getMessage(), 'error');
             return false;
         }
     }
@@ -1121,23 +1136,163 @@ class ArticleConverter
         // Echo to console only if not in test environment or if explicitly enabled
         // For now, let's assume we always echo for CLI scripts.
         // if (php_sapi_name() === 'cli' || (defined('ECHO_LOGS') && ECHO_LOGS)) {
-             echo $logMessage;
+        //     echo $logMessage; // Removed echo
         // }
 
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
+        $this->conversionLogMessages[] = $logMessage; // Store message internally
+    }
+
+    public function getConversionLogMessages()
+    {
+        return $this->conversionLogMessages;
     }
 }
 
-// Execute the conversion
-try {
-    $converter = new ArticleConverter();
-    $result = $converter->convert();
-    
-    if ($result) {
-        echo "Conversion completed successfully. Check the logs for details.\n";
+// Main script logic
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['task']) && $_POST['task'] === 'convert') {
+    // Start HTML output for results page early
+    echo '<!DOCTYPE html><html><head><title>Conversion Results</title><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uikit@3.21.16/dist/css/uikit.min.css" /></head><body><div class="uk-container uk-margin-top">';
+    echo '<h1>Conversion Results</h1>';
+
+    $converter = new ArticleConverter(); // Instantiate ArticleConverter early to capture all its logs
+
+    if (!isset($_POST['article_ids']) || empty($_POST['article_ids'])) {
+        echo '<div class="uk-alert uk-alert-warning" uk-alert><p>No articles were selected for conversion.</p></div>';
+        // Even if no articles selected, we might have logs from converter instantiation or other setup
+        $logMessages = $converter->getConversionLogMessages(); 
     } else {
-        echo "Conversion completed with errors. Check the logs for details.\n";
+        $selectedArticleIds = $_POST['article_ids']; // This will be an array of strings
+        // Ensure they are integers (convert method also does this, but good practice here too)
+        $selectedArticleIds = array_map('intval', $selectedArticleIds);
+
+        try {
+            $result = $converter->convert($selectedArticleIds); // Call convert with selected IDs
+
+            if ($result) {
+                echo '<div class="uk-alert uk-alert-success" uk-alert><p>Conversion process completed for the selection.</p></div>';
+                echo '<p>Processed article IDs: ' . htmlspecialchars(implode(', ', $selectedArticleIds)) . '</p>';
+            } else {
+                echo '<div class="uk-alert uk-alert-danger" uk-alert><p>There was an error during the conversion process (converter returned false).</p></div>';
+            }
+        } catch (Exception $e) {
+            error_log("Fatal error during conversion POST: " . $e->getMessage()); // Server log
+            echo '<div class="uk-alert uk-alert-danger" uk-alert><p>A critical error occurred: ' . htmlspecialchars($e->getMessage()) . '</p></div>';
+        }
+        $logMessages = $converter->getConversionLogMessages(); // Get all logs after processing
     }
-} catch (Exception $e) {
-    echo "Fatal error: " . $e->getMessage() . "\n";
+
+    // Display accumulated logs
+    if (!empty($logMessages)) {
+        echo '<h3>Detailed Conversion Log:</h3>';
+        echo '<pre class="uk-background-muted uk-padding-small" style="max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word;">';
+        foreach ($logMessages as $msg) {
+            echo htmlspecialchars(rtrim($msg, "\n")) . "\n"; // Trim potential existing newline, add HTML newline
+        }
+        echo '</pre>';
+    }
+    
+    // Common footer for results page
+    $logFileName = 'logs/pagebuilder_conversion_' . date('Y-m-d') . '.log'; // Construct expected log file name
+    echo '<p>Please check the server log file for detailed messages: <code>' . htmlspecialchars($logFileName) . '</code></p>';
+    echo '<p><a href="' . htmlspecialchars($_SERVER['PHP_SELF']) . '" class="uk-button uk-button-default">Go Back to Selection</a></p>';
+    echo '</div><script src="https://cdn.jsdelivr.net/npm/uikit@3.21.16/dist/js/uikit.min.js"></script><script src="https://cdn.jsdelivr.net/npm/uikit@3.21.16/dist/js/uikit-icons.min.js"></script></body></html>';
+
+} else {
+    // GET request or any other case: Display the article selection form
+    $articles = [];
+    $dbErrorMessage = '';
+
+    try {
+        $query = $db->getQuery(true)
+            ->select($db->quoteName(['id', 'title']))
+            ->from($db->quoteName('#__content'))
+            ->where($db->quoteName('introtext') . ' != ' . $db->quote(''))
+            ->where('(' . $db->quoteName('fulltext') . ' = ' . $db->quote('') . ' OR ' . $db->quoteName('fulltext') . ' IS NULL)')
+            ->order($db->quoteName('title') . ' ASC');
+        $db->setQuery($query);
+        $articles = $db->loadObjectList();
+    } catch (Exception $e) {
+        // Log the detailed error to server logs for admin, but show a generic message to user.
+        error_log("Database error fetching articles for form: " . $e->getMessage());
+        $dbErrorMessage = "Error fetching articles from the database. Please check server logs or contact an administrator.";
+    }
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JCE to Pagebuilder Converter</title>
+    <!-- UIkit CSS -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/uikit@3.19.2/dist/css/uikit.min.css" />
+    <style>
+        .article-list-container {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #e5e5e5;
+            padding: 10px;
+            margin-bottom: 15px;
+        }
+    </style>
+</head>
+<body>
+    <div class="uk-container uk-container-small uk-padding">
+        <h1 class="uk-heading-medium">JCE to Pagebuilder Converter</h1>
+        <p>Select articles to convert from JCE editor format (introtext) to YOOtheme Pro Pagebuilder format (fulltext).</p>
+        <p class="uk-text-meta">This script processes articles where 'introtext' is not empty and 'fulltext' is currently empty or null.</p>
+
+        <?php if (!empty($dbErrorMessage)): ?>
+            <div class="uk-alert-danger" uk-alert>
+                <a class="uk-alert-close" uk-close></a>
+                <p><?php echo htmlspecialchars($dbErrorMessage); ?></p>
+            </div>
+        <?php endif; ?>
+
+        <form method="post" action="<?php echo htmlspecialchars($_SERVER['PHP_SELF']); ?>" class="uk-form-stacked">
+            <input type="hidden" name="task" value="convert">
+
+            <div class="uk-margin">
+                <button type="button" class="uk-button uk-button-default uk-button-small" onclick="toggleAll(true)">Select All</button>
+                <button type="button" class="uk-button uk-button-default uk-button-small" onclick="toggleAll(false)">Deselect All</button>
+            </div>
+
+            <?php if (empty($articles) && empty($dbErrorMessage)): ?>
+                <p class="uk-text-warning">No articles found matching the criteria for conversion (non-empty introtext and empty fulltext).</p>
+            <?php elseif (!empty($articles)): ?>
+                <div class="article-list-container uk-margin">
+                    <?php foreach ($articles as $article): ?>
+                        <?php
+                            $escapedTitle = htmlspecialchars($article->title, ENT_QUOTES, 'UTF-8');
+                            $articleId = (int)$article->id;
+                        ?>
+                        <div class="uk-margin-small">
+                            <label><input class="uk-checkbox" type="checkbox" name="article_ids[]" value="<?php echo $articleId; ?>"> <?php echo $escapedTitle; ?> (ID: <?php echo $articleId; ?>)</label>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            <?php endif; ?>
+
+            <div class="uk-margin">
+                <button type="submit" class="uk-button uk-button-primary uk-button-large" <?php echo (empty($articles) || !empty($dbErrorMessage)) ? 'disabled' : ''; ?>>
+                    Convert Selected Articles
+                </button>
+            </div>
+        </form>
+    </div>
+
+    <!-- UIkit JS -->
+    <script src="https://cdn.jsdelivr.net/npm/uikit@3.19.2/dist/js/uikit.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/uikit@3.19.2/dist/js/uikit-icons.min.js"></script>
+    <script>
+        function toggleAll(checked) {
+            const checkboxes = document.querySelectorAll('input[name="article_ids[]"]');
+            checkboxes.forEach(checkbox => {
+                checkbox.checked = checked;
+            });
+        }
+    </script>
+</body>
+</html>
+<?php
 }
