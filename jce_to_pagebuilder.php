@@ -257,6 +257,67 @@ class ArticleConverter
         return $props;
     }
 
+    protected function getTextElementStyleProps(DOMNode $styledNode, $logContext = '') {
+        $textProps = [];
+        $nodeClassesStr = $styledNode->getAttribute('class');
+        if (empty($nodeClassesStr)) {
+            return $textProps; // No classes to process
+        }
+        $nodeClasses = explode(' ', $nodeClassesStr);
+        $appliedStyles = [];
+
+        $logNodeName = $styledNode->nodeName;
+        $logPrefix = "Styling from {$logNodeName}" . ($logContext ? " ({$logContext})" : "") . ": ";
+
+        // Text Alignment
+        if (in_array('text-center', $nodeClasses) || in_array('uk-text-center', $nodeClasses)) {
+            $textProps['text_align'] = 'center';
+            $appliedStyles[] = 'text_align:center';
+        } elseif (in_array('text-right', $nodeClasses) || in_array('uk-text-right', $nodeClasses)) {
+            $textProps['text_align'] = 'right';
+            $appliedStyles[] = 'text_align:right';
+        } elseif (in_array('text-justify', $nodeClasses) || in_array('uk-text-justify', $nodeClasses)) {
+            $textProps['text_align'] = 'justify';
+            $appliedStyles[] = 'text_align:justify';
+        }
+
+        // Text Style (Lead)
+        if (in_array('lead', $nodeClasses) || in_array('uk-text-lead', $nodeClasses)) {
+            $textProps['text_style'] = 'lead'; // YOOtheme Pro typically uses 'lead' for this
+            $appliedStyles[] = 'text_style:lead';
+        }
+        
+        // Font Size (Small) - YOOtheme Pro might handle this with utility classes or specific text style props.
+        // Adding to html_class is a common way if direct prop isn't available.
+        if (in_array('uk-text-small', $nodeClasses)) {
+            $textProps['html_class'] = ($textProps['html_class'] ?? '') . ' uk-text-small';
+            $appliedStyles[] = 'html_class:uk-text-small (for font_size:small)';
+        }
+
+        // Emphasis - Similar to small, could be a class or a YOOtheme Pro text style.
+        if (in_array('uk-text-emphasis', $nodeClasses)) {
+            if (!isset($textProps['text_style']) || $textProps['text_style'] !== 'lead') { // Don't override lead with emphasis if both are present
+                // YOOtheme Pro might have an 'emphasis' option for 'text_style', or use a class.
+                // $textProps['text_style'] = 'emphasis'; // If direct prop
+                $textProps['html_class'] = ($textProps['html_class'] ?? '') . ' uk-text-emphasis'; // If class-based
+                $appliedStyles[] = 'html_class:uk-text-emphasis (for emphasis)';
+            }
+        }
+        
+        // Clean up html_class if it was added and is only spaces
+        if (isset($textProps['html_class'])) {
+            $textProps['html_class'] = trim($textProps['html_class']);
+            if (empty($textProps['html_class'])) {
+                unset($textProps['html_class']);
+            }
+        }
+
+        if (!empty($appliedStyles)) {
+            $this->log($logPrefix . implode(', ', $appliedStyles) . ". Original classes: '" . $nodeClassesStr . "'", 'debug');
+        }
+        return $textProps;
+    }
+
     protected function parseContentIntoElements(DOMNode $parentNode)
 	{
 		$this->log("Preparing to parse children of node: {$parentNode->nodeName} with text coalescing logic");
@@ -309,8 +370,12 @@ class ArticleConverter
                     // B. Flush $textBuffer if not empty
                     $trimmedTextBuffer = trim($textBuffer);
                     if ($trimmedTextBuffer !== '') {
-                        $elements[] = ["type" => "text", "props" => ["column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBuffer]];
-                        $this->log("Added coalesced text element (before button): " . substr($trimmedTextBuffer, 0, 50) . "...");
+                        $textElementProps = array_merge(
+                            ["column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBuffer],
+                            $this->getTextElementStyleProps($parentNode, 'parent of buffered text before button')
+                        );
+                        $elements[] = ["type" => "text", "props" => $textElementProps];
+                        $this->log("Added coalesced text element (before button), possibly with parent styling: " . substr($trimmedTextBuffer, 0, 50) . "...");
                     }
                     $textBuffer = ''; // Reset buffer
 
@@ -342,13 +407,12 @@ class ArticleConverter
             $trimmedTextBufferOnBlock = trim($textBuffer);
             if ($trimmedTextBufferOnBlock !== '') {
                 $this->log("Flushing text buffer before processing block element: {$nodeNameLower}. Buffer content: " . substr($trimmedTextBufferOnBlock, 0, 50) . "...", 'debug');
-                $elements[] = [
-                    "type" => "text",
-                    "props" => [
-                        "column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBufferOnBlock
-                    ]
-                ];
-                $this->log("Added coalesced text element from buffer before block element {$nodeNameLower}.");
+                $textElementProps = array_merge(
+                    ["column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBufferOnBlock],
+                    $this->getTextElementStyleProps($parentNode, 'parent of buffered text before ' . $nodeNameLower)
+                );
+                $elements[] = ["type" => "text", "props" => $textElementProps];
+                $this->log("Added coalesced text element from buffer (before {$nodeNameLower}), possibly with parent styling.");
             }
             $textBuffer = ''; // Reset buffer
 
@@ -644,70 +708,17 @@ class ArticleConverter
                     // 3. Else (default for <p>) -> create "text" element, applying class-based styling
                     } else {
                         regular_paragraph_processing: // Label for goto
-                        $this->log("Paragraph treated as regular text content.");
-                        $content = $this->getInnerHtml($node);
+                        $this->log("Paragraph treated as regular text content, applying styles from <p> itself.");
+                        $content = $this->getInnerHtml($node); // $node is the <p>
                         if (trim($content) !== '') {
-                            $textProps = [
-                                "column_breakpoint" => "m",
-                                "margin" => "default",
-                                "content" => $content
-                            ];
-                            $p_classes_str = $node->getAttribute('class');
-                            $p_classes = explode(' ', $p_classes_str);
-                            $appliedStyles = [];
-
-                            if (in_array('lead', $p_classes) || in_array('uk-text-lead', $p_classes)) {
-                                $textProps['text_style'] = 'lead';
-                                $appliedStyles[] = 'text_style:lead';
-                            }
-                            if (in_array('text-center', $p_classes) || in_array('uk-text-center', $p_classes)) {
-                                $textProps['text_align'] = 'center';
-                                $appliedStyles[] = 'text_align:center';
-                            } elseif (in_array('text-right', $p_classes) || in_array('uk-text-right', $p_classes)) {
-                                $textProps['text_align'] = 'right';
-                                 $appliedStyles[] = 'text_align:right';
-                            } elseif (in_array('text-justify', $p_classes) || in_array('uk-text-justify', $p_classes)) {
-                                $textProps['text_align'] = 'justify';
-                                $appliedStyles[] = 'text_align:justify';
-                            }
-                            // Example for font_size - YOOtheme Pro might use utility classes like .uk-text-small
-                            if (in_array('uk-text-small', $p_classes)) {
-                                // $textProps['font_size'] = 'small'; // Direct mapping if available
-                                // Alternatively, YOOtheme Pro uses classes for this, so this might already be handled by the content itself.
-                                // For this example, let's assume a direct prop 'font_size' for demonstration,
-                                // but in reality, one might just let the class be part of the content.
-                                // Or, map to a specific YOOtheme Pro text style if applicable.
-                                $textProps['html_class'] = ($textProps['html_class'] ?? '') . ' uk-text-small';
-                                $appliedStyles[] = 'font_size:small (via uk-text-small class)';
-                            }
-                            if (in_array('uk-text-emphasis', $p_classes)) {
-                                // Similar to uk-text-small, this could be a class or a style.
-                                // For YOOtheme Pro, 'emphasis' might be a text_style value.
-                                $textProps['text_style'] = ($textProps['text_style'] ?? ''); // Ensure it exists
-                                $textProps['text_style'] = $textProps['text_style'] === 'lead' ? 'lead' : 'emphasis'; // Avoid overriding lead
-                                if ($textProps['text_style'] !== 'lead') $appliedStyles[] = 'text_style:emphasis';
-
-                            }
-                            // Add more class mappings as needed...
-    
-                            if (!empty($appliedStyles)) {
-                                $this->log("Applied styles to text element from p-classes: " . implode(', ', $appliedStyles) . " (original classes: '" . $p_classes_str . "')");
-                            }
-                            
-                            // Clean up html_class if it was added
-                            if (isset($textProps['html_class'])) {
-                                $textProps['html_class'] = trim($textProps['html_class']);
-                                if (empty($textProps['html_class'])) unset($textProps['html_class']);
-                            }
-
-
-                            $elements[] = [
-                                "type" => "text",
-                                "props" => $textProps
-                            ];
-                            $this->log("Paragraph converted to text element.");
+                            $textElementProps = array_merge(
+                                ["column_breakpoint" => "m", "margin" => "default", "content" => $content],
+                                $this->getTextElementStyleProps($node, 'paragraph node') // Pass the <p> node itself
+                            );
+                            $elements[] = ["type" => "text", "props" => $textElementProps];
+                            // Logging for applied styles is now inside getTextElementStyleProps
                         } else {
-                            $this->log("Paragraph is empty after trimming, skipping.");
+                            $this->log("Paragraph is empty after trimming, skipping.", 'debug');
                         }
                     }
                     break;
@@ -1012,18 +1023,15 @@ class ArticleConverter
         // 3. Final Buffer Flush After Loop
         $trimmedTextAtEnd = trim($textBuffer);
         if ($trimmedTextAtEnd !== '') {
-            $elements[] = [
-                "type" => "text",
-                "props" => [
-                    "column_breakpoint" => "m",
-                    "margin" => "default",
-                    "content" => $trimmedTextAtEnd
-                ]
-            ];
-            $this->log("Added final coalesced text element: " . substr($trimmedTextAtEnd, 0, 50) . "...");
+            $textElementProps = array_merge(
+                ["column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextAtEnd],
+                $this->getTextElementStyleProps($parentNode, 'parent of final buffered text')
+            );
+            $elements[] = ["type" => "text", "props" => $textElementProps];
+            $this->log("Added final coalesced text element, possibly with parent styling: " . substr($trimmedTextAtEnd, 0, 50) . "...");
         }
 		
-		$this->log("Final element count after coalescing: " . count($elements));
+		$this->log("Final element count after coalescing and styling: " . count($elements));
 		return $elements;
 	}
 	
