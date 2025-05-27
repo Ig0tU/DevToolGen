@@ -82,7 +82,28 @@ class ArticleConverter
         $this->backupArticle($article->id);
         
         // Parse the content and create appropriate elements
-        $elements = $this->parseContentIntoElements($article->introtext);
+        // $elements = $this->parseContentIntoElements($article->introtext);
+
+        // --- New DOM parsing logic ---
+        $introText = $article->introtext;
+        $dom = new DOMDocument('1.0', 'UTF-8');
+        libxml_use_internal_errors(true);
+        // Wrap content to ensure proper parsing if it's a fragment
+        $wrappedContent = '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>' . $introText . '</body></html>';
+        $dom->preserveWhiteSpace = true;
+        $dom->loadHTML($wrappedContent, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+        libxml_clear_errors();
+        $bodyNode = $dom->getElementsByTagName('body')->item(0);
+
+        if (!$bodyNode) {
+            $this->log("Error: Could not find body element in introtext for article ID {$article->id}", 'error');
+            // Handle error appropriately, perhaps return false or an empty array
+            $elements = [];
+        } else {
+            $elements = $this->parseContentIntoElements($bodyNode);
+        }
+        // --- End new DOM parsing logic ---
+        
         $this->log("Number of elements created: " . count($elements));
         
         if (empty($elements)) {
@@ -162,37 +183,107 @@ class ArticleConverter
 	}
 
 
-    protected function parseContentIntoElements($content)
+    protected function createImageElementProperties(DOMNode $imgNode, $figcaptionText = null)
+    {
+        $originalSrc = $imgNode->getAttribute('src');
+        $this->log("Creating image properties for original src: " . $originalSrc);
+
+        $processedSrc = $this->processImageSrc($originalSrc);
+
+        $altText = $imgNode->getAttribute('alt') ?: '';
+        $titleText = $imgNode->getAttribute('title') ?: '';
+
+        if ($figcaptionText && !empty(trim($figcaptionText))) {
+            $caption = trim($figcaptionText);
+            if (empty($titleText)) {
+                $titleText = $caption;
+                $this->log("Using figcaption for image title: " . $caption);
+            } elseif (empty($altText)) {
+                $altText = $caption;
+                $this->log("Using figcaption for image alt: " . $caption);
+            } else {
+                // If both are filled, append to title as per previous logic
+                $titleText .= " (" . $caption . ")";
+                $this->log("Appending figcaption to image title. New title: " . $titleText);
+            }
+        }
+
+        $width = $imgNode->getAttribute('width') ?: '';
+        $height = $imgNode->getAttribute('height') ?: '';
+
+        $style = $imgNode->getAttribute('style');
+        $alignment = 'none';
+        $marginRight = '';
+        $marginLeft = '';
+
+        if (strpos($style, 'float: right') !== false) {
+            $alignment = 'right';
+            if (preg_match('/margin-left\s*:\s*([^;]+)/i', $style, $matches)) {
+                // Basic check for common margin unit, could be more robust
+                if (strpos($matches[1], 'px') !== false || strpos($matches[1], 'em') !== false || strpos($matches[1], 'rem') !== false) {
+                     $marginLeft = 'medium'; // Placeholder, actual mapping might be more complex
+                     $this->log("Detected float right with margin-left, setting YOOtheme margin_left: medium");
+                }
+            }
+        } elseif (strpos($style, 'float: left') !== false) {
+            $alignment = 'left';
+            if (preg_match('/margin-right\s*:\s*([^;]+)/i', $style, $matches)) {
+                 if (strpos($matches[1], 'px') !== false || strpos($matches[1], 'em') !== false || strpos($matches[1], 'rem') !== false) {
+                    $marginRight = 'medium'; // Placeholder
+                    $this->log("Detected float left with margin-right, setting YOOtheme margin_right: medium");
+                }
+            }
+        }
+        
+        $props = [
+            "image"           => $originalSrc,
+            "src"             => $processedSrc,
+            "alt"             => $altText,
+            "title"           => $titleText,
+            "width"           => $width,
+            "height"          => $height,
+            "image_width"     => $width ? intval($width) : null,
+            "image_height"    => $height ? intval($height) : null,
+            "image_size"      => ($width && $height) ? 'auto' : 'auto', // YOOtheme usually defaults to auto or handles it.
+            "image_svg_color" => "emphasis", // Default
+            "margin"          => "default",    // Default
+            "uk_img"          => true,         // Default
+            "position"        => $alignment,
+            "margin_right"    => $marginRight,
+            "margin_left"     => $marginLeft
+        ];
+        
+        $this->log("Created image properties: " . json_encode($props));
+        return $props;
+    }
+
+    protected function parseContentIntoElements(DOMNode $parentNode)
 	{
-		$this->log("Starting content parsing");
+		$this->log("Preparing to parse children of node: {$parentNode->nodeName}");
 		
 		$elements = [];
+        $definedButtonClasses = ['btn', 'button', 'uk-button', 'uk-button-primary', 'uk-button-secondary', 'uk-button-danger', 'uk-button-text', 'uk-button-link', 'uk-button-large', 'uk-button-small', 'uk-width-1-1'];
 		
-		// Ensure we have a proper HTML structure
-		$wrappedContent = '<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>' . $content . '</body></html>';
-		
-		// Split content by significant HTML elements
-		$dom = new DOMDocument('1.0', 'UTF-8');
-		libxml_use_internal_errors(true);
-		
-		// Load the HTML and preserve white space
-		$dom->preserveWhiteSpace = true;
-		$dom->loadHTML($wrappedContent, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
-		
-		// Clear any XML errors
-		$errors = libxml_get_errors();
-		libxml_clear_errors();
-		
-		// Get the body content
-		$body = $dom->getElementsByTagName('body')->item(0);
-		
-		if (!$body) {
-			$this->log("No body tag found!", 'error');
-			return $elements;
-		}
-		
-		// Process each child node of the body
-		foreach ($body->childNodes as $node) {
+		// Process each child node of the parentNode
+		foreach ($parentNode->childNodes as $node) {
+			// Handle Text Nodes
+			if ($node->nodeType === XML_TEXT_NODE) {
+				$textContent = trim($node->nodeValue);
+				if (!empty($textContent)) {
+					$elements[] = [ 
+						"type" => "text",
+						"props" => [
+							"column_breakpoint" => "m",
+							"margin" => "default",
+							"content" => $textContent
+						]
+					];
+					$this->log("Added text element from text node.");
+				}
+				continue;
+			}
+
+			// Skip comments, PIs, etc.
 			if ($node->nodeType !== XML_ELEMENT_NODE) {
 				continue;
 			}
@@ -226,141 +317,403 @@ class ArticleConverter
 					break;
 	
 				case 'div':
-					// Add debug logging
-					$this->log("Processing div node");
-					$children = $node->childNodes;
-					$this->log("Div has " . $children->length . " children");
-				
-					// Check if div contains only an image
-					if ($children->length === 1 && $children->item(0)->nodeName === 'img') {
-						$this->log("Found single image in div - processing as image element");
-						$imgNode = $children->item(0);
-						$src = $imgNode->getAttribute('src');
-						
-						if (!empty($src)) {
-							$originalSrc = $src;
-							
-							// Handle relative URLs for src
-							if (strpos($src, 'http') !== 0 && strpos($src, '//') !== 0) {
-								$src = ltrim($src, '/');
-								$siteUrl = \Joomla\CMS\Uri\Uri::root();
-								$src = $siteUrl . $src;
-							}
-				
-							$width = $imgNode->getAttribute('width') ?: '';
-							$height = $imgNode->getAttribute('height') ?: '';
-							
-							$elements[] = [
-								"type" => "image",
-								"props" => [
-									"image_svg_color" => "emphasis",
-									"margin" => "default",
-									"image" => $originalSrc,
-									"image_width" => intval($width),
-									"image_height" => intval($height),
-									"image_size" => "auto",
-									"src" => $src,
-									"alt" => $imgNode->getAttribute('alt') ?: '',
-									"title" => $imgNode->getAttribute('title') ?: '',
-									"width" => $width,
-									"height" => $height,
-									"uk_img" => true,
-									"position" => "none"
-								]
-							];
-							$this->log("Added image element: " . $src);
-						}
+					$this->log("Processing div node with class: " . $node->getAttribute('class'));
+					
+					// Recursively parse children of the div
+					$nestedElements = $this->parseContentIntoElements($node); // Pass the div itself as the new parent
+					
+					if (!empty($nestedElements)) {
+						$elements = array_merge($elements, $nestedElements);
+						$this->log("Added " . count($nestedElements) . " elements from div's children.");
 					} else {
-						// Handle as regular div content
-						$content = $this->getInnerHtml($node);
-						if (trim($content) !== '') {
-							$elements[] = [
-								"type" => "text",
-								"props" => [
-									"column_breakpoint" => "m",
-									"margin" => "default",
-									"content" => $content
-								]
-							];
-						}
+						$this->log("Div node (class: " . $node->getAttribute('class') . ") resulted in no elements after parsing its children.");
 					}
 					break;
-    
+                
+                case 'article':
+                case 'section':
+                case 'aside':
+                case 'footer':
+                case 'header':
+                    $this->log("Processing " . $node->nodeName . " node with class: " . $node->getAttribute('class'));
+                    $nestedElements = $this->parseContentIntoElements($node); // Pass the node itself as the new parent
+                    if (!empty($nestedElements)) {
+                        $elements = array_merge($elements, $nestedElements);
+                        $this->log("Added " . count($nestedElements) . " elements from " . $node->nodeName . "'s children.");
+                    } else {
+                        $this->log($node->nodeName . " node (class: " . $node->getAttribute('class') . ") resulted in no elements after parsing its children.");
+                    }
+                    break;
+
+                case 'figure':
+                    $this->log("Processing figure node.");
+                    $imgNode = null;
+                    $figcaptionNode = null;
+                    $otherContent = false;
+
+                    foreach ($node->childNodes as $childNode) {
+                        if ($childNode->nodeType === XML_ELEMENT_NODE) {
+                            if (strtolower($childNode->nodeName) === 'img') {
+                                if ($imgNode === null) { // Process first image found
+                                    $imgNode = $childNode;
+                                } else {
+                                    $otherContent = true; // More than one image or other elements
+                                }
+                            } elseif (strtolower($childNode->nodeName) === 'figcaption') {
+                                if ($figcaptionNode === null) { // Process first figcaption
+                                    $figcaptionNode = $childNode;
+                                } else {
+                                    $otherContent = true; // More than one figcaption
+                                }
+                            } elseif (trim($childNode->textContent) !== '') {
+                                $otherContent = true; // Other non-empty element nodes
+                            }
+                        } elseif ($childNode->nodeType === XML_TEXT_NODE && trim($childNode->nodeValue) !== '') {
+                            $otherContent = true; // Or non-empty text nodes
+                        }
+                    }
+
+                    if ($imgNode && !$otherContent) { // Prioritize image extraction if an img is present and no other significant content
+                        $this->log("Found img element within figure.");
+                        $src = $imgNode->getAttribute('src');
+                        if (!empty($src)) {
+                            $originalSrc = $src;
+                            $style = $imgNode->getAttribute('style');
+                            $alignment = 'none';
+                            $marginRight = '';
+                            $marginLeft = '';
+                            if (strpos($style, 'float: right') !== false) { $alignment = 'right'; if (strpos($style, 'margin-right') !== false) { $marginRight = 'medium'; }}
+                            elseif (strpos($style, 'float: left') !== false) { $alignment = 'left'; if (strpos($style, 'margin-left') !== false) { $marginLeft = 'medium'; }}
+                            $width = $imgNode->getAttribute('width') ?: '';
+                            $height = $imgNode->getAttribute('height') ?: '';
+                            if (strpos($src, 'http') !== 0 && strpos($src, '//') !== 0) {
+                                $src = ltrim($src, '/');
+                                $siteUrl = \Joomla\CMS\Uri\Uri::root();
+                                $src = $siteUrl . $src;
+                            }
+                            $altText = $imgNode->getAttribute('alt') ?: '';
+                            $titleText = $imgNode->getAttribute('title') ?: '';
+
+                            $captionTextForHelper = $figcaptionNode ? trim($figcaptionNode->textContent) : null;
+                            $imageProps = $this->createImageElementProperties($imgNode, $captionTextForHelper);
+                            $elements[] = ["type" => "image", "props" => $imageProps];
+                            // Log message now part of createImageElementProperties
+                        } else {
+                             $this->log("Image in figure has empty src, falling back to recursive parsing for figure.", 'warning');
+                             $nestedElements = $this->parseContentIntoElements($node); // $node here is the <figure> element
+                             if (!empty($nestedElements)) { 
+                                 $elements = array_merge($elements, $nestedElements); 
+                                 $this->log("Added " . count($nestedElements) . " elements from figure's children recursively after empty src image."); 
+                             }
+                        }
+                    } else {
+                        if ($imgNode && $otherContent) {
+                            $this->log("Figure contains an image but also other complex content. Parsing all children recursively.");
+                        } elseif (!$imgNode) {
+                            $this->log("No img found in figure, or figure is empty. Parsing children recursively (if any).");
+                        }
+                        $nestedElements = $this->parseContentIntoElements($node);
+                        if (!empty($nestedElements)) {
+                            $elements = array_merge($elements, $nestedElements);
+                            $this->log("Added " . count($nestedElements) . " elements from figure's children (fallback/complex content).");
+                        } else {
+                             $this->log("Figure node resulted in no elements after recursive parsing (fallback/complex content).");
+                        }
+                    }
+                    break;
+
+                case 'nav':
+                    $this->log("Processing nav node.");
+                    $foundList = false;
+                    foreach ($node->childNodes as $childNode) {
+                        if ($childNode->nodeType === XML_ELEMENT_NODE && (strtolower($childNode->nodeName) === 'ul' || strtolower($childNode->nodeName) === 'ol')) {
+                            $this->log("Found " . $childNode->nodeName . " list inside nav. Processing as list.");
+                            // Simplified list processing for nav - directly using the ul/ol case logic by creating a temporary DOM for the list node
+                            // This is a bit of a workaround. A helper function `parseSingleNodeAsList` would be cleaner.
+                            // For now, we'll just extract list items directly.
+                            $listItems = $childNode->getElementsByTagName('li');
+                            $items = [];
+                            foreach ($listItems as $li) {
+                                // Try to find a link within the li
+                                $linkNode = null;
+                                foreach($li->childNodes as $liChild) {
+                                    if ($liChild->nodeType === XML_ELEMENT_NODE && strtolower($liChild->nodeName) === 'a') {
+                                        $linkNode = $liChild;
+                                        break;
+                                    }
+                                }
+
+                                if ($linkNode) {
+                                     $items[] = [
+                                        "type" => "list_item", // Or a more specific nav_item if schema allows
+                                        "props" => [
+                                            "content" => trim($this->getInnerHTML($linkNode)), // Changed to getInnerHTML
+                                            "link_href" => $linkNode->getAttribute('href'), // Link href
+                                            // Potentially add other link attributes if needed
+                                        ]
+                                    ];
+                                } else {
+                                     $items[] = [ // Fallback for li without a direct link
+                                        "type" => "list_item",
+                                        "props" => [
+                                            "content" => trim($this->getInnerHTML($li)) // Changed to getInnerHTML
+                                        ]
+                                    ];
+                                }
+                            }
+                            if (!empty($items)) {
+                                $elements[] = [
+                                    "type" => "list", // Or "menu" / "navigation" if available
+                                    "props" => [
+                                        "column_breakpoint" => "m", "image_align" => "left", "image_svg_color" => "emphasis",
+                                        "image_vertical_align" => true, "list_element" => $childNode->nodeName,
+                                        "list_horizontal_separator" => ", ", "list_type" => "vertical",
+                                        "show_image" => true, "show_link" => true
+                                        // Potentially add nav-specific props
+                                    ],
+                                    "children" => $items
+                                ];
+                                $this->log("Added list element from nav with " . count($items) . " items.");
+                                $foundList = true;
+                            }
+                            break; // Process first found list and then stop for this nav
+                        }
+                    }
+
+                    if (!$foundList) {
+                        $this->log("No direct ul/ol found in nav, or list was empty. Parsing children recursively.");
+                        $nestedElements = $this->parseContentIntoElements($node);
+                        if (!empty($nestedElements)) {
+                            $elements = array_merge($elements, $nestedElements);
+                            $this->log("Added " . count($nestedElements) . " elements from nav's children (fallback).");
+                        } else {
+                            $this->log("Nav node resulted in no elements after recursive parsing (fallback).");
+                        }
+                    }
+                    break;
+
     			case 'p':
-					// Check if paragraph contains only an image
-					$children = $node->childNodes;
-					if ($children->length === 1 && $children->item(0)->nodeName === 'img') {
-						// Handle the image directly
-						$imgNode = $children->item(0);
-						$src = $imgNode->getAttribute('src');
-						if (!empty($src)) {
-							$originalSrc = $src;
-							
-							// Get style attribute and parse it
-							$style = $imgNode->getAttribute('style');
-							$alignment = 'none';
-							$marginRight = '';
-							$marginLeft = '';
-							
-							if (strpos($style, 'float: right') !== false) {
-								$alignment = 'right';
-								if (strpos($style, 'margin-right') !== false) {
-									$marginRight = 'medium';
-								}
-							} elseif (strpos($style, 'float: left') !== false) {
-								$alignment = 'left';
-								if (strpos($style, 'margin-left') !== false) {
-									$marginLeft = 'medium';
-								}
-							}
-				
-							// Handle relative URLs for src
-							if (strpos($src, 'http') !== 0 && strpos($src, '//') !== 0) {
-								$src = ltrim($src, '/');
-								$siteUrl = \Joomla\CMS\Uri\Uri::root();
-								$src = $siteUrl . $src;
-							}
-				
-							$width = $imgNode->getAttribute('width') ?: '';
-							$height = $imgNode->getAttribute('height') ?: '';
-							
-							$elements[] = [
-								"type" => "image",
-								"props" => [
-									"image_svg_color" => "emphasis",
-									"margin" => "default",
-									"image" => $originalSrc,
-									"image_width" => intval($width),
-									"image_height" => intval($height),
-									"image_size" => "auto",
-									"src" => $src,
-									"alt" => $imgNode->getAttribute('alt') ?: '',
-									"title" => $imgNode->getAttribute('title') ?: '',
-									"width" => $width,
-									"height" => $height,
-									"uk_img" => true,
-									"position" => $alignment,
-									"margin_right" => $marginRight,
-									"margin_left" => $marginLeft
-								]
-							];
-							$this->log("Added image element: " . $src);
-						}
-					} else {
-						// Handle as regular paragraph
-						$content = $this->getInnerHtml($node);
-						if (trim($content) !== '') {
-							$elements[] = [
-								"type" => "text",
-								"props" => [
-									"column_breakpoint" => "m",
-									"margin" => "default",
-									"content" => $content
-								]
-							];
-						}
-					}
-					break;
+                    $this->log("Processing p node.");
+                    $childNodes = [];
+                    foreach ($node->childNodes as $child) {
+                        if ($child->nodeType === XML_ELEMENT_NODE) {
+                            $childNodes[] = $child;
+                        } elseif ($child->nodeType === XML_TEXT_NODE && trim($child->nodeValue) !== '') {
+                            // If there's significant text content alongside an element, it's not a "single child" case
+                            $childNodes[] = $child; // Add it to consider for length check
+                        }
+                    }
+    
+                    // 1. Single Image Check
+                    if (count($childNodes) === 1 && strtolower($childNodes[0]->nodeName) === 'img') {
+                        $imgNode = $childNodes[0];
+                        $this->log("Paragraph contains a single image.");
+                        $src = $imgNode->getAttribute('src');
+                        if (!empty($src)) {
+                            $originalSrc = $src;
+                            $style = $imgNode->getAttribute('style');
+                            $alignment = 'none'; $marginRight = ''; $marginLeft = '';
+                            if (strpos($style, 'float: right') !== false) { $alignment = 'right'; if (strpos($style, 'margin-right') !== false) $marginRight = 'medium'; } 
+                            elseif (strpos($style, 'float: left') !== false) { $alignment = 'left'; if (strpos($style, 'margin-left') !== false) $marginLeft = 'medium'; }
+                            
+                            if (strpos($src, 'http') !== 0 && strpos($src, '//') !== 0) {
+                                $src = ltrim($src, '/');
+                                $siteUrl = \Joomla\CMS\Uri\Uri::root();
+                                $src = $siteUrl . $src;
+                            }
+                            $imageProps = $this->createImageElementProperties($imgNode);
+                            $elements[] = ["type" => "image", "props" => $imageProps];
+                            // Log message now part of createImageElementProperties
+                        } else {
+                            $this->log("Paragraph with single image has empty src. Skipping direct image conversion, will be handled by parent or default.", 'warning');
+                            // Potentially fall back to processing the paragraph as text if the image src is empty
+                            // This case might need review if <p><img src=""></p> should produce an empty text element or nothing.
+                            // For now, it produces nothing if src is empty.
+                        }
+                    // 2. Button Detection
+                    } elseif (count($childNodes) === 1 && strtolower($childNodes[0]->nodeName) === 'a') {
+                        $linkNode = $childNodes[0];
+                        $linkClasses = explode(' ', $linkNode->getAttribute('class'));
+                        $buttonClasses = ['btn', 'button', 'uk-button'];
+                        $isButton = false;
+                        foreach ($buttonClasses as $btnClass) {
+                            if (in_array($btnClass, $linkClasses)) {
+                                $isButton = true;
+                                break;
+                            }
+                        }
+    
+                        if ($isButton) {
+                            $this->log("Paragraph contains a link with button class(es). Converting to button element.");
+                            $buttonProps = [
+                                "button_style" => "default", // Default YOOtheme Pro style
+                                "link_title" => trim($this->getInnerHTML($linkNode)), // Use innerHTML for rich content like icons
+                                "link_href" => $linkNode->getAttribute('href') ?: '#',
+                                "margin" => "default"
+                            ];
+                            // Map common button style classes
+                            if (in_array('uk-button-primary', $linkClasses)) $buttonProps['button_style'] = 'primary';
+                            if (in_array('uk-button-secondary', $linkClasses)) $buttonProps['button_style'] = 'secondary';
+                            if (in_array('uk-button-danger', $linkClasses)) $buttonProps['button_style'] = 'danger';
+                            if (in_array('uk-button-text', $linkClasses)) $buttonProps['button_style'] = 'text';
+                            if (in_array('uk-button-link', $linkClasses)) $buttonProps['button_style'] = 'link'; // Note: YOOtheme might have 'text' or specific link style
+
+                            // Map size classes
+                            if (in_array('uk-button-small', $linkClasses)) $buttonProps['button_size'] = 'small';
+                            if (in_array('uk-button-large', $linkClasses)) $buttonProps['button_size'] = 'large';
+                            
+                            // Full width
+                            if (in_array('uk-width-1-1', $linkClasses)) $buttonProps['full_width'] = true;
+
+                            $elements[] = [
+                                "type" => "button",
+                                "props" => $buttonProps
+                            ];
+                            $this->log("Converted paragraph to button: " . $buttonProps['link_title']);
+                        } else {
+                             // It's a paragraph with a single link, but not styled as a button - treat as regular text
+                            $this->log("Paragraph with a single link (not a button) - converting to text element.");
+                            goto regular_paragraph_processing;
+                        }
+                    // 3. Else (default for <p>) -> create "text" element, applying class-based styling
+                    } else {
+                        regular_paragraph_processing: // Label for goto
+                        $this->log("Paragraph treated as regular text content.");
+                        $content = $this->getInnerHtml($node);
+                        if (trim($content) !== '') {
+                            $textProps = [
+                                "column_breakpoint" => "m",
+                                "margin" => "default",
+                                "content" => $content
+                            ];
+                            $p_classes_str = $node->getAttribute('class');
+                            $p_classes = explode(' ', $p_classes_str);
+                            $appliedStyles = [];
+
+                            if (in_array('lead', $p_classes) || in_array('uk-text-lead', $p_classes)) {
+                                $textProps['text_style'] = 'lead';
+                                $appliedStyles[] = 'text_style:lead';
+                            }
+                            if (in_array('text-center', $p_classes) || in_array('uk-text-center', $p_classes)) {
+                                $textProps['text_align'] = 'center';
+                                $appliedStyles[] = 'text_align:center';
+                            } elseif (in_array('text-right', $p_classes) || in_array('uk-text-right', $p_classes)) {
+                                $textProps['text_align'] = 'right';
+                                 $appliedStyles[] = 'text_align:right';
+                            } elseif (in_array('text-justify', $p_classes) || in_array('uk-text-justify', $p_classes)) {
+                                $textProps['text_align'] = 'justify';
+                                $appliedStyles[] = 'text_align:justify';
+                            }
+                            // Example for font_size - YOOtheme Pro might use utility classes like .uk-text-small
+                            if (in_array('uk-text-small', $p_classes)) {
+                                // $textProps['font_size'] = 'small'; // Direct mapping if available
+                                // Alternatively, YOOtheme Pro uses classes for this, so this might already be handled by the content itself.
+                                // For this example, let's assume a direct prop 'font_size' for demonstration,
+                                // but in reality, one might just let the class be part of the content.
+                                // Or, map to a specific YOOtheme Pro text style if applicable.
+                                $textProps['html_class'] = ($textProps['html_class'] ?? '') . ' uk-text-small';
+                                $appliedStyles[] = 'font_size:small (via uk-text-small class)';
+                            }
+                            if (in_array('uk-text-emphasis', $p_classes)) {
+                                // Similar to uk-text-small, this could be a class or a style.
+                                // For YOOtheme Pro, 'emphasis' might be a text_style value.
+                                $textProps['text_style'] = ($textProps['text_style'] ?? ''); // Ensure it exists
+                                $textProps['text_style'] = $textProps['text_style'] === 'lead' ? 'lead' : 'emphasis'; // Avoid overriding lead
+                                if ($textProps['text_style'] !== 'lead') $appliedStyles[] = 'text_style:emphasis';
+
+                            }
+                            // Add more class mappings as needed...
+    
+                            if (!empty($appliedStyles)) {
+                                $this->log("Applied styles to text element from p-classes: " . implode(', ', $appliedStyles) . " (original classes: '" . $p_classes_str . "')");
+                            }
+                            
+                            // Clean up html_class if it was added
+                            if (isset($textProps['html_class'])) {
+                                $textProps['html_class'] = trim($textProps['html_class']);
+                                if (empty($textProps['html_class'])) unset($textProps['html_class']);
+                            }
+
+
+                            $elements[] = [
+                                "type" => "text",
+                                "props" => $textProps
+                            ];
+                            $this->log("Paragraph converted to text element.");
+                        } else {
+                            $this->log("Paragraph is empty after trimming, skipping.");
+                        }
+                    }
+                    break;
+
+                case 'a':
+                    $this->log("Processing a node: " . $node->getAttribute('href'));
+                    $a_node_classes_str = $node->getAttribute('class');
+                    $a_node_classes = explode(' ', $a_node_classes_str);
+                    $is_a_button = false;
+                    foreach ($definedButtonClasses as $btnClass) {
+                        if (in_array($btnClass, $a_node_classes)) {
+                            $is_a_button = true;
+                            break;
+                        }
+                    }
+
+                    if ($is_a_button) {
+                        $this->log("<a> tag with href '" . $node->getAttribute('href') . "' has button class(es) '" . $a_node_classes_str . "'. Converting to button element.");
+                        $buttonProps = [
+                            "button_style" => "default",
+                            "link_title" => trim($this->getInnerHTML($node)),
+                            "link_href" => $node->getAttribute('href') ?: '#',
+                            "margin" => "default" // Standard margin for standalone buttons
+                        ];
+                        if (in_array('uk-button-primary', $a_node_classes)) $buttonProps['button_style'] = 'primary';
+                        elseif (in_array('uk-button-secondary', $a_node_classes)) $buttonProps['button_style'] = 'secondary';
+                        elseif (in_array('uk-button-danger', $a_node_classes)) $buttonProps['button_style'] = 'danger';
+                        elseif (in_array('uk-button-text', $a_node_classes)) $buttonProps['button_style'] = 'text';
+                        elseif (in_array('uk-button-link', $a_node_classes)) $buttonProps['button_style'] = 'link';
+                        
+                        if (in_array('uk-button-large', $a_node_classes)) $buttonProps['button_size'] = 'large';
+                        if (in_array('uk-button-small', $a_node_classes)) $buttonProps['button_size'] = 'small';
+                        if (in_array('uk-width-1-1', $a_node_classes)) $buttonProps['full_width'] = true;
+
+                        $elements[] = ["type" => "button", "props" => $buttonProps];
+                        $this->log("Converted <a> tag to page builder 'button'. Title: '" . $buttonProps['link_title'] . "', Href: '" . $buttonProps['link_href'] . "'");
+                    } else {
+                        $this->log("<a> tag with href '" . $node->getAttribute('href') . "' is a regular inline link. It will be preserved by parent's getInnerHTML. Skipping direct element creation.");
+                        // No element is created; the link will be part of the parent's innerHTML.
+                    }
+                    break;
+
+                case 'button':
+                    $this->log("Processing button node: " . $this->getInnerHTML($node));
+                    $button_node_classes_str = $node->getAttribute('class');
+                    $button_node_classes = explode(' ', $button_node_classes_str);
+                    
+                    $buttonProps = [
+                        "button_style" => "default",
+                        "link_title" => trim($this->getInnerHTML($node)),
+                        "link_href" => '#', // Default for <button> tags as they don't have href
+                        "margin" => "default"
+                    ];
+
+                    // Map classes similar to <a> buttons
+                    if (in_array('uk-button-primary', $button_node_classes)) $buttonProps['button_style'] = 'primary';
+                    elseif (in_array('uk-button-secondary', $button_node_classes)) $buttonProps['button_style'] = 'secondary';
+                    elseif (in_array('uk-button-danger', $button_node_classes)) $buttonProps['button_style'] = 'danger';
+                    elseif (in_array('uk-button-text', $button_node_classes)) $buttonProps['button_style'] = 'text';
+                    elseif (in_array('uk-button-link', $button_node_classes)) $buttonProps['button_style'] = 'link';
+
+                    if (in_array('uk-button-large', $button_node_classes)) $buttonProps['button_size'] = 'large';
+                    if (in_array('uk-button-small', $button_node_classes)) $buttonProps['button_size'] = 'small';
+                    if (in_array('uk-width-1-1', $button_node_classes)) $buttonProps['full_width'] = true;
+                    
+                    // Consider HTML <button type="submit"> or type="button"
+                    // This might not directly map to YOOtheme Pro button element types, but can be logged or stored if needed.
+                    // For now, we assume all <button> tags become clickable buttons in page builder.
+
+                    $elements[] = ["type" => "button", "props" => $buttonProps];
+                    $this->log("Converted <button> tag to page builder 'button'. Title: '" . $buttonProps['link_title'] . "'");
+                    break;
 	
 				case 'ul':
 				case 'ol':
@@ -374,7 +727,7 @@ class ArticleConverter
 							$items[] = [
 								"type" => "list_item",
 								"props" => [
-									"content" => trim($li->textContent)
+									"content" => trim($this->getInnerHTML($li)) // Changed to getInnerHTML
 								]
 							];
 						}
@@ -426,36 +779,11 @@ class ArticleConverter
 						$width = $node->getAttribute('width') ?: '';
 						$height = $node->getAttribute('height') ?: '';
 						
-						// Handle relative URLs for src
-						if (strpos($src, 'http') !== 0 && strpos($src, '//') !== 0) {
-							$src = ltrim($src, '/');
-							$siteUrl = \Joomla\CMS\Uri\Uri::root();
-							$src = $siteUrl . $src;
-						}
-						
-						$elements[] = [
-							"type" => "image",
-							"props" => [
-								"image_svg_color" => "emphasis",
-								"margin" => "default",
-								"image" => $originalSrc,  // Original relative path
-								"image_width" => intval($width),  // Integer width
-								"image_height" => intval($height), // Integer height
-								"image_size" => "auto",
-								"src" => $src,  // Full URL
-								"alt" => $node->getAttribute('alt') ?: '',
-								"title" => $node->getAttribute('title') ?: '',
-								"width" => $width,  // Original width string
-								"height" => $height, // Original height string
-								"uk_img" => true,
-								"position" => $alignment,
-								"margin_right" => $marginRight,
-								"margin_left" => $marginLeft
-							]
-						];
-						$this->log("Added image element: " . $src);
+                        $imageProps = $this->createImageElementProperties($node); // $node is the <img> tag
+                        $elements[] = ["type" => "image", "props" => $imageProps];
+						// Log message now part of createImageElementProperties
 					} else {
-						$this->log("Skipped image with empty src attribute", 'warning');
+						$this->log("Skipped image with empty src attribute.", 'warning');
 					}
 					break;
 				case 'table':
@@ -616,19 +944,21 @@ class ArticleConverter
 					break;
 					
 				default:
-					// For any other HTML elements, wrap them in a text element
-					if (!empty($nodeContent)) {
-						$elements[] = [
-							"type" => "text",
-							"props" => [
-								"column_breakpoint" => "m",
-								"margin" => "default",
-								"content" => $nodeContent
-							]
-						];
-						$this->log("Added generic text element for " . $node->nodeName);
-					}
-					break;
+                    $nodeContent = trim($this->getInnerHTML($node));
+                    if (!empty($nodeContent)) {
+                        $this->log("Node '" . $node->nodeName . "' not explicitly handled. Converting its innerHTML to a 'text' element.", 'debug');
+                        $elements[] = [
+                            "type" => "text",
+                            "props" => [
+                                "column_breakpoint" => "m",
+                                "margin" => "default",
+                                "content" => $nodeContent
+                            ]
+                        ];
+                    } else {
+                        $this->log("Node '" . $node->nodeName . "' not explicitly handled and its innerHTML is empty. Skipping.", 'debug');
+                    }
+                    break;
 			}
 		}
 		
@@ -655,13 +985,26 @@ class ArticleConverter
 	
 	protected function processElementImages(&$element)
 	{
-		// Process image properties in the current element
+        // This method might be redundant if createImageElementProperties correctly sets absolute 'src'
+        // and if 'image' property is intended to remain the original relative src.
+        // For now, let's assume 'image' should remain original and 'src' is handled.
+        // If 'src' might not always be absolute from createImageElementProperties, this could be a safeguard.
+        $this->log("Reviewing element for image processing (processElementImages): type " . ($element['type'] ?? 'unknown'));
+
 		if (isset($element['props'])) {
-			if (isset($element['props']['image'])) {
-				$element['props']['image'] = $this->processImageSrc($element['props']['image']);
-			}
-			if (isset($element['props']['src'])) {
-				$element['props']['src'] = $this->processImageSrc($element['props']['src']);
+            // 'image' property should hold the original src, so we don't process it here.
+			// if (isset($element['props']['image'])) {
+			// 	 $element['props']['image'] = $this->processImageSrc($element['props']['image']);
+			// }
+
+            // 'src' should have been processed by createImageElementProperties.
+            // This is a safeguard or if other elements also use 'src' for images.
+			if (isset($element['props']['src']) && is_string($element['props']['src'])) {
+                // Only process if it's not already a full URL
+                if (!(strpos($element['props']['src'], 'http') === 0 || strpos($element['props']['src'], '//') === 0)) {
+                    $this->log("processElementImages: Processing 'src' property: " . $element['props']['src']);
+				    $element['props']['src'] = $this->processImageSrc($element['props']['src']);
+                }
 			}
 		}
 	
@@ -708,9 +1051,17 @@ class ArticleConverter
     protected function log($message, $type = 'info')
     {
         $date = date('Y-m-d H:i:s');
-        $logMessage = "[$date][$type] $message\n";
+        // Ensure type is a string and sanitize it to prevent injection if it were ever from user input (though it's not here)
+        $type = preg_replace('/[^a-zA-Z0-9_-]/', '', $type);
+        $logMessage = "[$date][" . strtoupper($type) . "] $message\n";
+        
+        // Echo to console only if not in test environment or if explicitly enabled
+        // For now, let's assume we always echo for CLI scripts.
+        // if (php_sapi_name() === 'cli' || (defined('ECHO_LOGS') && ECHO_LOGS)) {
+             echo $logMessage;
+        // }
+
         file_put_contents($this->logFile, $logMessage, FILE_APPEND);
-        echo $logMessage;
     }
 }
 
