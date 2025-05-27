@@ -166,15 +166,15 @@ class ArticleConverter
 			$this->db->execute();
 			
 			// Also clear the introtext to prevent readmore being added there
-			$query = $this->db->getQuery(true)
-				->update($this->db->quoteName('#__content'))
-				->set($this->db->quoteName('introtext') . ' = ' . $this->db->quote(''))
-				->where($this->db->quoteName('id') . ' = ' . (int)$article->id);
+			// $query = $this->db->getQuery(true)
+			// 	->update($this->db->quoteName('#__content'))
+			// 	->set($this->db->quoteName('introtext') . ' = ' . $this->db->quote(''))
+			// 	->where($this->db->quoteName('id') . ' = ' . (int)$article->id);
 				
-			$this->db->setQuery($query);
-			$this->db->execute();
+			// $this->db->setQuery($query);
+			// $this->db->execute();
 	
-			$this->log("Successfully updated article ID {$article->id}");
+			$this->log("Successfully updated article ID {$article->id} (introtext preserved).");
 			return true;
 		} catch (Exception $e) {
 			$this->log("Error updating article ID {$article->id}: " . $e->getMessage(), 'error');
@@ -236,8 +236,8 @@ class ArticleConverter
         }
         
         $props = [
-            "image"           => $originalSrc,
-            "src"             => $processedSrc,
+            "image"           => $originalSrc, // Keep original path for YOOtheme Pro
+            // "src"             => $processedSrc, // Remove processed/absolute src
             "alt"             => $altText,
             "title"           => $titleText,
             "width"           => $width,
@@ -985,30 +985,24 @@ class ArticleConverter
 	
 	protected function processElementImages(&$element)
 	{
-        // This method might be redundant if createImageElementProperties correctly sets absolute 'src'
-        // and if 'image' property is intended to remain the original relative src.
-        // For now, let's assume 'image' should remain original and 'src' is handled.
-        // If 'src' might not always be absolute from createImageElementProperties, this could be a safeguard.
-        $this->log("Reviewing element for image processing (processElementImages): type " . ($element['type'] ?? 'unknown'));
+        // This method's image-specific responsibilities are now handled by createImageElementProperties
+        // for 'image' and 'src' fields at the point of element creation.
+        // It no longer needs to process 'image' or 'src' here.
+        // $this->log("Reviewing element for image processing (processElementImages): type " . ($element['type'] ?? 'unknown'));
 
-		if (isset($element['props'])) {
+		// if (isset($element['props'])) {
             // 'image' property should hold the original src, so we don't process it here.
-			// if (isset($element['props']['image'])) {
-			// 	 $element['props']['image'] = $this->processImageSrc($element['props']['image']);
+			// if (isset($element['props']['image']) && is_string($element['props']['image'])) {
+            //    $this->log("processElementImages: Original 'image' property: " . $element['props']['image'] . " - Leaving as is.");
 			// }
 
-            // 'src' should have been processed by createImageElementProperties.
-            // This is a safeguard or if other elements also use 'src' for images.
-			if (isset($element['props']['src']) && is_string($element['props']['src'])) {
-                // Only process if it's not already a full URL
-                if (!(strpos($element['props']['src'], 'http') === 0 || strpos($element['props']['src'], '//') === 0)) {
-                    $this->log("processElementImages: Processing 'src' property: " . $element['props']['src']);
-				    $element['props']['src'] = $this->processImageSrc($element['props']['src']);
-                }
-			}
-		}
+            // 'src' property is no longer added by createImageElementProperties.
+			// if (isset($element['props']['src']) && is_string($element['props']['src'])) {
+            //    $this->log("processElementImages: Original 'src' property: " . $element['props']['src'] . " - Leaving as is or ensuring it's correctly set if needed elsewhere.");
+			// }
+		// }
 	
-		// Recursively process children
+		// Recursively process children - This part should remain if other properties need recursive processing.
 		if (isset($element['children']) && is_array($element['children'])) {
 			foreach ($element['children'] as &$child) {
 				$this->processElementImages($child);
