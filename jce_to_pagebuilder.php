@@ -259,45 +259,111 @@ class ArticleConverter
 
     protected function parseContentIntoElements(DOMNode $parentNode)
 	{
-		$this->log("Preparing to parse children of node: {$parentNode->nodeName}");
+		$this->log("Preparing to parse children of node: {$parentNode->nodeName} with text coalescing logic");
 		
 		$elements = [];
+        $textBuffer = '';
         $definedButtonClasses = ['btn', 'button', 'uk-button', 'uk-button-primary', 'uk-button-secondary', 'uk-button-danger', 'uk-button-text', 'uk-button-link', 'uk-button-large', 'uk-button-small', 'uk-width-1-1'];
-		
-		// Process each child node of the parentNode
+        $inlineTags = ['strong', 'em', 'b', 'i', 'u', 'span', 'br', 'code', 'small', 'mark', 'sub', 'sup', 'font', 'abbr', 'acronym', 'cite', 'del', 'ins', 'q', 's', 'samp', 'var', 'time', 'kbd']; // Added more common inline tags
+
 		foreach ($parentNode->childNodes as $node) {
-			// Handle Text Nodes
+            // A.1 Handle Text Nodes
 			if ($node->nodeType === XML_TEXT_NODE) {
-				$textContent = trim($node->nodeValue);
-				if (!empty($textContent)) {
-					$elements[] = [ 
-						"type" => "text",
-						"props" => [
-							"column_breakpoint" => "m",
-							"margin" => "default",
-							"content" => $textContent
-						]
-					];
-					$this->log("Added text element from text node.");
-				}
+				// $this->log("Node is XML_TEXT_NODE, appending to textBuffer. Current buffer length: " . strlen($textBuffer), 'debug');
+				$textBuffer .= $node->nodeValue;
+				// $this->log("Appended nodeValue. New buffer length: " . strlen($textBuffer), 'debug');
 				continue;
 			}
 
-			// Skip comments, PIs, etc.
+            // Skip comments, PIs, etc.
 			if ($node->nodeType !== XML_ELEMENT_NODE) {
+                // $this->log("Node is not XML_ELEMENT_NODE or XML_TEXT_NODE (type: {$node->nodeType}). Skipping.", 'debug');
 				continue;
 			}
 			
-			$nodeContent = trim($this->getInnerHTML($node));
-			$textContent = trim($node->textContent);
-			
-			// Skip if both innerHTML and textContent are empty
-			if (empty($nodeContent) && empty($textContent)) {
-				$this->log("Skipping empty node: " . $node->nodeName);
-				continue;
+            $nodeNameLower = strtolower($node->nodeName);
+            // $this->log("Processing element node: {$nodeNameLower}. Current textBuffer: '" . substr($textBuffer,0,30) . "...'", 'debug');
+
+            // A.2 Handle common inline HTML elements
+            if (in_array($nodeNameLower, $inlineTags)) {
+                $inlineHtml = $node->ownerDocument->saveHTML($node);
+                // $this->log("Node {$nodeNameLower} is inline, appending its HTML to textBuffer. HTML: " . $inlineHtml, 'debug');
+                $textBuffer .= $inlineHtml;
+                continue;
+            }
+
+            // A.3 Special Handling for 'a' tags (button vs inline link)
+            if ($nodeNameLower === 'a') {
+                $is_a_button = false;
+                $a_node_classes_str = $node->getAttribute('class');
+                $a_node_classes = explode(' ', $a_node_classes_str);
+                foreach ($definedButtonClasses as $btnClass) {
+                    if (in_array($btnClass, $a_node_classes)) {
+                        $is_a_button = true;
+                        break;
+                    }
+                }
+
+                if ($is_a_button) {
+                    $this->log("Node <a> is a button. Flushing textBuffer first.", 'debug');
+                    // B. Flush $textBuffer if not empty
+                    $trimmedTextBuffer = trim($textBuffer);
+                    if ($trimmedTextBuffer !== '') {
+                        $elements[] = ["type" => "text", "props" => ["column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBuffer]];
+                        $this->log("Added coalesced text element (before button): " . substr($trimmedTextBuffer, 0, 50) . "...");
+                    }
+                    $textBuffer = ''; // Reset buffer
+
+                    // Process button <a>
+                    $this->log("<a> tag with href '" . $node->getAttribute('href') . "' has button class(es) '" . $a_node_classes_str . "'. Converting to button element.");
+                    $buttonProps = [
+                        "button_style" => "default", "link_title" => trim($this->getInnerHTML($node)),
+                        "link_href" => $node->getAttribute('href') ?: '#', "margin" => "default"
+                    ];
+                    if (in_array('uk-button-primary', $a_node_classes)) $buttonProps['button_style'] = 'primary';
+                    elseif (in_array('uk-button-secondary', $a_node_classes)) $buttonProps['button_style'] = 'secondary';
+                    // ... other button style mappings ...
+                    if (in_array('uk-button-large', $a_node_classes)) $buttonProps['button_size'] = 'large';
+                    if (in_array('uk-button-small', $a_node_classes)) $buttonProps['button_size'] = 'small';
+                    if (in_array('uk-width-1-1', $a_node_classes)) $buttonProps['full_width'] = true;
+                    $elements[] = ["type" => "button", "props" => $buttonProps];
+                    $this->log("Converted <a> tag to page builder 'button'. Title: '" . $buttonProps['link_title'] . "'");
+                } else { // Is an inline link
+                    $inlineLinkHtml = $node->ownerDocument->saveHTML($node);
+                    // $this->log("Node <a> is an inline link, appending its HTML to textBuffer. HTML: " . $inlineLinkHtml, 'debug');
+                    $textBuffer .= $inlineLinkHtml;
+                }
+                continue; 
+            }
+
+            // B. Handling Block-Level/Complex Elements (and Flushing Buffer)
+            // If we reach here, it's a block-level or complex element.
+            // Time to flush any accumulated text.
+            $trimmedTextBufferOnBlock = trim($textBuffer);
+            if ($trimmedTextBufferOnBlock !== '') {
+                $this->log("Flushing text buffer before processing block element: {$nodeNameLower}. Buffer content: " . substr($trimmedTextBufferOnBlock, 0, 50) . "...", 'debug');
+                $elements[] = [
+                    "type" => "text",
+                    "props" => [
+                        "column_breakpoint" => "m", "margin" => "default", "content" => $trimmedTextBufferOnBlock
+                    ]
+                ];
+                $this->log("Added coalesced text element from buffer before block element {$nodeNameLower}.");
+            }
+            $textBuffer = ''; // Reset buffer
+
+            // Existing logic for block-level elements
+			$nodeContent = trim($this->getInnerHTML($node)); // Used by some cases like table, blockquote
+			$textContent = trim($node->textContent); // Used by h1-h6
+
+			// Skip if both innerHTML and textContent are empty (applies to block elements being processed now)
+            // This check might be less relevant now with text coalescing, but keeping for safety for cases that rely on $nodeContent or $textContent.
+			if (empty($nodeContent) && empty($textContent) && !in_array($nodeNameLower, ['img'])) { // IMG can be empty of textContent but have src
+				$this->log("Skipping empty block node after buffer flush: " . $nodeNameLower, 'debug');
+				continue; 
 			}
-			
-			switch (strtolower($node->nodeName)) {
+
+			switch ($nodeNameLower) {
 				case 'h1':
 				case 'h2':
 				case 'h3':
@@ -716,79 +782,64 @@ class ArticleConverter
                     break;
 	
 				case 'ul':
-				case 'ol':
-					if (!empty($nodeContent)) {
-						// Get all list items
+                    // $nodeContent check might not be relevant if list can be empty but still valid.
+                    // For now, keeping it as it was.
+					if (!empty($nodeContent)) { 
 						$listItems = $node->getElementsByTagName('li');
 						$items = [];
-						
-						// Create list_item elements for each li
 						foreach ($listItems as $li) {
 							$items[] = [
 								"type" => "list_item",
-								"props" => [
-									"content" => trim($this->getInnerHTML($li)) // Changed to getInnerHTML
-								]
+								"props" => ["content" => trim($this->getInnerHTML($li))]
 							];
 						}
-				
-						$elements[] = [
-							"type" => "list",
-							"props" => [
-								"column_breakpoint" => "m",
-								"image_align" => "left",
-								"image_svg_color" => "emphasis",
-								"image_vertical_align" => true,
-								"list_element" => $node->nodeName, // "ul" or "ol"
-								"list_horizontal_separator" => ", ",
-								"list_type" => "vertical",
-								"show_image" => true,
-								"show_link" => true
-							],
-							"children" => $items
+						$listProps = [
+							"column_breakpoint" => "m", "image_align" => "left", "image_svg_color" => "emphasis",
+							"image_vertical_align" => true, "list_element" => "ul", "list_horizontal_separator" => ", ",
+							"list_type" => "vertical", "show_image" => true, "show_link" => true
 						];
-						$this->log("Added {$node->nodeName} list element with " . count($items) . " items");
-					}
+						$elements[] = ["type" => "list", "props" => $listProps, "children" => $items];
+						$this->log("Added UL list element with " . count($items) . " items.");
+					} else {
+                        $this->log("Skipping empty UL node.", "debug");
+                    }
+					break;
+
+				case 'ol':
+					if (!empty($nodeContent)) {
+						$listItems = $node->getElementsByTagName('li');
+						$items = [];
+						foreach ($listItems as $li) {
+							$items[] = [
+								"type" => "list_item",
+								"props" => ["content" => trim($this->getInnerHTML($li))]
+							];
+						}
+						$listProps = [
+							"column_breakpoint" => "m", "image_align" => "left", "image_svg_color" => "emphasis",
+							"image_vertical_align" => true, "list_element" => "ol", "list_horizontal_separator" => ", ",
+							"list_type" => "vertical", "show_image" => true, "show_link" => true,
+							"css" => ".el-element { list-style-type: decimal; padding-left: 20px }"
+						];
+						$elements[] = ["type" => "list", "props" => $listProps, "children" => $items];
+						$this->log("Added OL list element with " . count($items) . " items and custom CSS.");
+					} else {
+                        $this->log("Skipping empty OL node.", "debug");
+                    }
 					break;
 				
 				case 'img':
 					$src = $node->getAttribute('src');
 					if (!empty($src)) {
-						// Store original src for 'image' property
-						$originalSrc = $src;
-						
-						// Get style attribute and parse it
-						$style = $node->getAttribute('style');
-						$alignment = 'none';
-						$marginRight = '';
-						$marginLeft = '';
-						
-						if (strpos($style, 'float: right') !== false) {
-							$alignment = 'right';
-							if (strpos($style, 'margin-right') !== false) {
-								$marginRight = 'medium';
-							}
-						} elseif (strpos($style, 'float: left') !== false) {
-							$alignment = 'left';
-							if (strpos($style, 'margin-left') !== false) {
-								$marginLeft = 'medium';
-							}
-						}
-				
-						// Get width and height
-						$width = $node->getAttribute('width') ?: '';
-						$height = $node->getAttribute('height') ?: '';
-						
                         $imageProps = $this->createImageElementProperties($node); // $node is the <img> tag
                         $elements[] = ["type" => "image", "props" => $imageProps];
-						// Log message now part of createImageElementProperties
 					} else {
 						$this->log("Skipped image with empty src attribute.", 'warning');
 					}
 					break;
 				case 'table':
-					if (!empty($nodeContent)) {
-						// Get table headers and count columns
+                    // $nodeContent check might not be relevant if table can be empty but still valid.
+					if (!empty($nodeContent)) { 
 						$headers = [];
 						$columnCount = 0;
 				
@@ -945,24 +996,34 @@ class ArticleConverter
 					
 				default:
                     $nodeContent = trim($this->getInnerHTML($node));
-                    if (!empty($nodeContent)) {
-                        $this->log("Node '" . $node->nodeName . "' not explicitly handled. Converting its innerHTML to a 'text' element.", 'debug');
-                        $elements[] = [
-                            "type" => "text",
-                            "props" => [
-                                "column_breakpoint" => "m",
-                                "margin" => "default",
-                                "content" => $nodeContent
-                            ]
-                        ];
-                    } else {
-                        $this->log("Node '" . $node->nodeName . "' not explicitly handled and its innerHTML is empty. Skipping.", 'debug');
-                    }
+                    // This 'default' is for block-level like elements not handled above.
+                    // As per refined plan, these should also append to textBuffer and continue.
+                    // However, the buffer flush ALREADY happened.
+                    // So, if we append to textBuffer here and continue, it will be part of the *next* text flush.
+                    // This makes sense for unknown tags that might appear within a flow of text.
+                    $this->log("Default case for element (after pre-flush): " . $nodeNameLower . ". Appending its HTML to text buffer.", "debug");
+                    $textBuffer .= $node->ownerDocument->saveHTML($node); // Append its own HTML
+                    // No 'continue' here, as it's the end of this iteration's switch.
+                    // The content appended here will be flushed either before the next block element or at the end of the loop.
                     break;
 			}
-		}
+		} // End foreach
+
+        // 3. Final Buffer Flush After Loop
+        $trimmedTextAtEnd = trim($textBuffer);
+        if ($trimmedTextAtEnd !== '') {
+            $elements[] = [
+                "type" => "text",
+                "props" => [
+                    "column_breakpoint" => "m",
+                    "margin" => "default",
+                    "content" => $trimmedTextAtEnd
+                ]
+            ];
+            $this->log("Added final coalesced text element: " . substr($trimmedTextAtEnd, 0, 50) . "...");
+        }
 		
-		$this->log("Final element count: " . count($elements));
+		$this->log("Final element count after coalescing: " . count($elements));
 		return $elements;
 	}
 	
